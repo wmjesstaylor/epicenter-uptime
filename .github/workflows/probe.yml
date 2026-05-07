@@ -1,0 +1,114 @@
+name: Epicenter CDN feed probe
+
+# External uptime probe for the Epicenter R2 CDN feed object. Lives
+# OFF poseidon (on GitHub Actions) so it can detect "poseidon is
+# entirely down" — the failure mode poseidon-local checks miss by
+# definition. Catches:
+#   - poseidon dead (curl times out / non-2xx)
+#   - poseidon up but feed-builder broken (Last-Modified > 15 min ago)
+#   - Cloudflare R2 incident (curl error / non-2xx)
+#
+# Notification: Pushover on failure (sub-second push to your phone).
+# Falls back silent if Pushover secrets aren't configured — you'll
+# still see the failed run in GitHub's Actions UI and get the
+# default GitHub email notification on workflow failure.
+
+on:
+  schedule:
+    # Every 5 minutes. Feed-builder runs every 5 too, so this matches
+    # the upstream cadence. GitHub Actions cron has known imprecision
+    # (up to ~15 min late during platform load); that's fine for a
+    # "is poseidon dead?" check where minutes-late beats hours-late
+    # which is what we'd get without any external probe.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}    # manual trigger for testing
+
+# If a probe is still running when the next scheduled fires, skip
+# the new one rather than queueing. Avoids backlog buildup if a
+# notification step is slow.
+concurrency:
+  group: probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      FEED_URL: https://pub-66026398b34f4c7092ac1cec0a76eaa8.r2.dev/30day.geojson
+      # 15 min — feed-builder runs every 5 min, so 15 = 3 missed
+      # cycles. Tight enough to catch real outages quickly, loose
+      # enough to ride out one bad cycle without false-positive.
+      MAX_STALE_SEC: '900'
+    steps:
+      - name: Check CDN feed health
+        id: check
+        run: |
+          set -uo pipefail
+
+          HEADERS=$(curl -sIL --max-time 30 "$FEED_URL") || {
+            echo "reason=curl failed contacting $FEED_URL" >> "$GITHUB_OUTPUT"
+            echo "::error::curl failed contacting $FEED_URL"
+            exit 1
+          }
+
+          STATUS=$(echo "$HEADERS" | grep -E '^HTTP/' | tail -1 | awk '{print $2}')
+          if [ "$STATUS" != "200" ]; then
+            echo "reason=HTTP $STATUS" >> "$GITHUB_OUTPUT"
+            echo "::error::feed returned HTTP $STATUS"
+            exit 1
+          fi
+
+          LAST_MOD=$(echo "$HEADERS" | grep -i '^last-modified:' | sed 's/^[Ll]ast-[Mm]odified:[[:space:]]*//' | tr -d '\r' | tail -1)
+          if [ -z "$LAST_MOD" ]; then
+            echo "reason=Last-Modified header missing" >> "$GITHUB_OUTPUT"
+            echo "::error::Last-Modified header missing"
+            exit 1
+          fi
+
+          LAST_EPOCH=$(date -d "$LAST_MOD" +%s 2>/dev/null) || {
+            echo "reason=Last-Modified parse failed: $LAST_MOD" >> "$GITHUB_OUTPUT"
+            echo "::error::Last-Modified parse failed: $LAST_MOD"
+            exit 1
+          }
+
+          NOW_EPOCH=$(date +%s)
+          AGE_SEC=$((NOW_EPOCH - LAST_EPOCH))
+          AGE_MIN=$((AGE_SEC / 60))
+
+          if [ "$AGE_SEC" -gt "$MAX_STALE_SEC" ]; then
+            echo "reason=feed is ${AGE_MIN}m stale (>$((MAX_STALE_SEC/60))m threshold)" >> "$GITHUB_OUTPUT"
+            echo "::error::feed is ${AGE_MIN}m stale (>$((MAX_STALE_SEC/60))m threshold)"
+            exit 1
+          fi
+
+          echo "OK: status=$STATUS, age=${AGE_MIN}m"
+
+      - name: Notify Pushover on failure
+        if: failure()
+        env:
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          REASON: ${{ steps.check.outputs.reason }}
+        run: |
+          if [ -z "$PUSHOVER_USER_KEY" ] || [ -z "$PUSHOVER_APP_TOKEN" ]; then
+            echo "::warning::Pushover secrets not configured; relying on GitHub's default failure email only"
+            exit 0
+          fi
+
+          REASON_TEXT="${REASON:-unknown failure}"
+
+          # priority=1 — high priority, bypasses Pushover quiet hours
+          # but doesn't require acknowledgment (priority=2 does that
+          # and is reserved for absolutely-must-act-now alerts).
+          curl -s --max-time 10 \
+            --form-string "token=$PUSHOVER_APP_TOKEN" \
+            --form-string "user=$PUSHOVER_USER_KEY" \
+            --form-string "title=Epicenter CDN feed unhealthy" \
+            --form-string "message=Probe at $(date -u '+%Y-%m-%d %H:%M UTC'). Reason: $REASON_TEXT. Check poseidon." \
+            --form-string "priority=1" \
+            --form-string "url_title=GitHub Actions run" \
+            --form-string "url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            https://api.pushover.net/1/messages.json \
+            -o /tmp/pushover-response.json -w "Pushover HTTP %{http_code}\n"
+          cat /tmp/pushover-response.json

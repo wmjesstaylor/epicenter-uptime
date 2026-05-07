@@ -39,7 +39,7 @@ jobs:
       # 15 min — feed-builder runs every 5 min, so 15 = 3 missed
       # cycles. Tight enough to catch real outages quickly, loose
       # enough to ride out one bad cycle without false-positive.
-      MAX_STALE_SEC: '900'
+      MAX_STALE_SEC: '1'
     steps:
       - name: Check CDN feed health
         id: check

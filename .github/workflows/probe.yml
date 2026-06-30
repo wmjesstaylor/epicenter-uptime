@@ -35,7 +35,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     env:
-      FEED_URL: https://pub-66026398b34f4c7092ac1cec0a76eaa8.r2.dev/30day.geojson
+      # Probe BOTH the canonical custom domain (what production clients
+      # hit since the 2026-05-28 cutover) AND the legacy R2 URL (still
+      # serves v1.9.13 and earlier). Checking the custom domain catches
+      # a DNS / Cloudflare-routing break even when the underlying R2
+      # object is fine — the legacy-only probe was blind to that.
+      FEED_URLS: |
+        https://feed.seismology.rocks/30day.geojson
+        https://pub-66026398b34f4c7092ac1cec0a76eaa8.r2.dev/30day.geojson
       # 15 min — feed-builder runs every 5 min, so 15 = 3 missed
       # cycles. Tight enough to catch real outages quickly, loose
       # enough to ride out one bad cycle without false-positive.
@@ -46,43 +53,42 @@ jobs:
         run: |
           set -uo pipefail
 
-          HEADERS=$(curl -sIL --max-time 30 "$FEED_URL") || {
-            echo "reason=curl failed contacting $FEED_URL" >> "$GITHUB_OUTPUT"
-            echo "::error::curl failed contacting $FEED_URL"
+          # Record the failure reason for the Pushover step, then exit.
+          fail() {
+            echo "reason=$1" >> "$GITHUB_OUTPUT"
+            echo "::error::$1"
             exit 1
           }
 
-          STATUS=$(echo "$HEADERS" | grep -E '^HTTP/' | tail -1 | awk '{print $2}')
-          if [ "$STATUS" != "200" ]; then
-            echo "reason=HTTP $STATUS" >> "$GITHUB_OUTPUT"
-            echo "::error::feed returned HTTP $STATUS"
-            exit 1
-          fi
+          # Here-string (not a pipe) so the loop runs in the current
+          # shell and fail()'s exit propagates out of the workflow step.
+          while IFS= read -r FEED_URL; do
+            [ -z "$FEED_URL" ] && continue
+            echo "Probing $FEED_URL"
 
-          LAST_MOD=$(echo "$HEADERS" | grep -i '^last-modified:' | sed 's/^[Ll]ast-[Mm]odified:[[:space:]]*//' | tr -d '\r' | tail -1)
-          if [ -z "$LAST_MOD" ]; then
-            echo "reason=Last-Modified header missing" >> "$GITHUB_OUTPUT"
-            echo "::error::Last-Modified header missing"
-            exit 1
-          fi
+            HEADERS=$(curl -sIL --max-time 30 "$FEED_URL") \
+              || fail "curl failed contacting $FEED_URL"
 
-          LAST_EPOCH=$(date -d "$LAST_MOD" +%s 2>/dev/null) || {
-            echo "reason=Last-Modified parse failed: $LAST_MOD" >> "$GITHUB_OUTPUT"
-            echo "::error::Last-Modified parse failed: $LAST_MOD"
-            exit 1
-          }
+            STATUS=$(echo "$HEADERS" | grep -E '^HTTP/' | tail -1 | awk '{print $2}')
+            [ "$STATUS" = "200" ] || fail "$FEED_URL returned HTTP $STATUS"
 
-          NOW_EPOCH=$(date +%s)
-          AGE_SEC=$((NOW_EPOCH - LAST_EPOCH))
-          AGE_MIN=$((AGE_SEC / 60))
+            LAST_MOD=$(echo "$HEADERS" | grep -i '^last-modified:' | sed 's/^[Ll]ast-[Mm]odified:[[:space:]]*//' | tr -d '\r' | tail -1)
+            [ -n "$LAST_MOD" ] || fail "Last-Modified header missing for $FEED_URL"
 
-          if [ "$AGE_SEC" -gt "$MAX_STALE_SEC" ]; then
-            echo "reason=feed is ${AGE_MIN}m stale (>$((MAX_STALE_SEC/60))m threshold)" >> "$GITHUB_OUTPUT"
-            echo "::error::feed is ${AGE_MIN}m stale (>$((MAX_STALE_SEC/60))m threshold)"
-            exit 1
-          fi
+            LAST_EPOCH=$(date -d "$LAST_MOD" +%s 2>/dev/null) \
+              || fail "Last-Modified parse failed for $FEED_URL: $LAST_MOD"
 
-          echo "OK: status=$STATUS, age=${AGE_MIN}m"
+            NOW_EPOCH=$(date +%s)
+            AGE_SEC=$((NOW_EPOCH - LAST_EPOCH))
+            AGE_MIN=$((AGE_SEC / 60))
+
+            [ "$AGE_SEC" -le "$MAX_STALE_SEC" ] \
+              || fail "$FEED_URL is ${AGE_MIN}m stale (>$((MAX_STALE_SEC/60))m threshold)"
+
+            echo "OK: $FEED_URL status=$STATUS age=${AGE_MIN}m"
+          done <<< "$FEED_URLS"
+
+          echo "All feeds healthy"
 
       - name: Notify Pushover on failure
         if: failure()

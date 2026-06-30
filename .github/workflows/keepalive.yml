@@ -1,0 +1,40 @@
+name: Keepalive
+
+# GitHub disables *scheduled* workflows after 60 days of no repo
+# activity (commits). This repo is otherwise dormant — the probe just
+# runs on its cron — so without periodic activity GitHub would disable
+# the probe (the off-poseidon CDN watchdog) right when we need it most.
+#
+# This job makes a weekly empty commit, which counts as repo activity
+# and resets the 60-day disable clock for ALL scheduled workflows here
+# (including this one). Weekly (not monthly) gives margin: even if a
+# run or two is throttled/skipped, we stay well inside the 60-day window.
+#
+# Self-contained on purpose — no third-party action, so there's no
+# supply-chain surface on the thing that keeps our watchdog alive.
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'    # Mondays 09:17 UTC (off-the-hour to dodge load)
+  workflow_dispatch: {}      # manual trigger
+
+permissions:
+  contents: write            # needed to push the keepalive commit
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty commit to reset the scheduled-workflow disable timer
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive (reset scheduled-workflow disable timer)"
+          git push

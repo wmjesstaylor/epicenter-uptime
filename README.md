@@ -7,15 +7,34 @@ definition — namely, "poseidon itself is dead."
 
 ## What it checks
 
-A workflow scheduled every 5 minutes that:
+A workflow scheduled every 5 minutes that, for **both** feed URLs:
 
-1. `curl`s the public CDN feed URL (R2 object)
+- the canonical custom domain `feed.seismology.rocks/30day.geojson`
+  (what production clients hit since the 2026-05-28 cutover)
+- the legacy R2 URL `pub-…r2.dev/30day.geojson` (still serves
+  v1.9.13 and earlier)
+
+1. `curl`s the URL
 2. Verifies HTTP 2xx status
 3. Parses the `Last-Modified` header
 4. Fails if the feed is more than **15 min stale** (3 missed
    feed-builder cycles — feed-builder runs every 5 min)
 5. On failure, sends a high-priority Pushover push notification
    to the operator's phone
+
+Probing both means a DNS / Cloudflare-routing break on the custom
+domain is caught even when the underlying R2 object is healthy —
+the failure mode a legacy-URL-only probe is blind to.
+
+## Keepalive (don't let GitHub disable the watchdog)
+
+GitHub disables *scheduled* workflows after **60 days of no repo
+commits**. This repo is otherwise dormant, so `keepalive.yml` makes
+a weekly empty commit to reset that clock for all scheduled
+workflows here (including itself). It's self-contained — no
+third-party action on the thing that keeps the watchdog alive. If
+the probe ever does get disabled, re-enable it in the Actions tab
+and push any commit to re-arm the timer.
 
 ## Why it lives here, not on poseidon
 

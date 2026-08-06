@@ -177,6 +177,24 @@ if [ "$RC" -ne 0 ]; then
 fi
 
 log "HEALTHY all feeds"
+
+# ── Heartbeat (watch the watcher) ─────────────────────────────────────
+# This probe can shout when the FEED breaks. Nothing shouts when the PROBE
+# breaks — a stopped timer, a dead box, a bad edit — and silence from a monitor
+# is indistinguishable from "everything is fine". That is the failure mode that
+# makes people trust a monitor that stopped working months ago.
+#
+# So ping an external dead-man's-switch on every healthy run. If the pings stop,
+# THAT service alerts. Deliberately only on the healthy path: a genuine feed
+# fault already alerts through Pushover/email, and continuing to send heartbeats
+# while unhealthy would tell the watcher everything is fine.
+#
+# HEARTBEAT_URL works with UptimeRobot Heartbeat, healthchecks.io, Better Stack
+# — any "ping me or I alarm" endpoint. Unset = skipped.
+if [ -n "${HEARTBEAT_URL:-}" ]; then
+    hb=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "$HEARTBEAT_URL") || hb="curl-failed"
+    log "heartbeat: HTTP $hb"
+fi
 # Recovery is worth a push: it closes the loop on an alert you already acted on.
 # priority=0 — informational, must not bypass quiet hours.
 if [ "$PREV_STATUS" = "unhealthy" ]; then

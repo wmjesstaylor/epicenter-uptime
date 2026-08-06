@@ -53,6 +53,13 @@ ALERT_EMAIL=
 ALERT_FROM=info@odysseymaps.io
 MSMTP_ACCOUNT=proton
 
+# --- Heartbeat: something that alarms when THIS PROBE stops ---
+# Pinged on every healthy run. If the pings stop — dead box, stopped timer,
+# broken edit — that service alerts. Without it, a monitor that quietly died
+# looks exactly like a monitor reporting all-clear.
+# Works with UptimeRobot Heartbeat, healthchecks.io, Better Stack. Blank = off.
+HEARTBEAT_URL=
+
 # --- Tuning (defaults shown; uncomment to change) ---
 # MAX_STALE_SEC=900     # 15 min = 3 missed feed-builder cycles
 # REALERT_SEC=3600      # while unhealthy, re-alert at most hourly

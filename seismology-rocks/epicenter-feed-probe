@@ -1,0 +1,168 @@
+#!/bin/bash
+# External uptime probe for the Epicenter CDN feed, run from seismology.rocks.
+#
+# WHY HERE. The GitHub Actions probe (.github/workflows/probe.yml) does the same
+# checks, but GitHub deprioritises high-frequency cron on public repos: measured
+# 2026-08-06, a */5 schedule actually fired every ~98 min (median; 54-201 min
+# range, 12 runs in 24h against ~288 scheduled). That is fine for "was it up
+# today" and useless for "is it down right now". A systemd timer on a box we own
+# actually runs every 5 minutes.
+#
+# seismology.rocks is NOT poseidon, so this still satisfies the original
+# constraint: it can detect "poseidon is entirely down", the failure mode that
+# poseidon-local checks miss by definition. Keep it that way — never move this
+# onto poseidon.
+#
+# Catches:
+#   - poseidon dead                  (curl times out / non-2xx)
+#   - feed-builder broken            (Last-Modified older than MAX_STALE_SEC,
+#                                     while the CDN happily serves 200 — the
+#                                     failure a plain HTTP uptime check CANNOT
+#                                     see, and the reason this exists at all)
+#   - Cloudflare / R2 / DNS incident (curl error, non-2xx, routing break)
+#
+# Config lives in /etc/epicenter-feed-probe.env (0600, root) — it holds the
+# Pushover credentials and is deliberately NOT in this public repo.
+set -uo pipefail
+
+CONF=/etc/epicenter-feed-probe.env
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+# Probe BOTH the canonical custom domain (what production clients hit since the
+# 2026-05-28 cutover) and the legacy R2 URL (still serving v1.9.13 and earlier).
+# The custom domain catches a DNS/Cloudflare-routing break even when the
+# underlying R2 object is perfectly fine.
+FEED_URLS="${FEED_URLS:-https://feed.seismology.rocks/30day.geojson
+https://pub-66026398b34f4c7092ac1cec0a76eaa8.r2.dev/30day.geojson}"
+
+# 15 min — feed-builder runs every 5, so this is 3 missed cycles: tight enough
+# to catch a real outage fast, loose enough to ride out one bad cycle.
+MAX_STALE_SEC="${MAX_STALE_SEC:-900}"
+
+# While a fault persists, re-alert at most this often. Without it a 5-minute
+# timer would push 12 times an hour and get muted, which is how a monitor
+# quietly stops being a monitor.
+REALERT_SEC="${REALERT_SEC:-3600}"
+
+STATE_DIR="${STATE_DIR:-/var/lib/epicenter-feed-probe}"
+STATE_FILE="$STATE_DIR/state"
+
+log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+# Echoes a human reason and returns 1 on the first unhealthy feed; silent + 0
+# when every feed passes. Checks are ordered cheapest-first.
+check_feeds() {
+    local url headers status last_mod last_epoch now_epoch age_sec age_min
+    while IFS= read -r url; do
+        [ -z "$url" ] && continue
+
+        headers=$(curl -sIL --max-time 30 "$url") || {
+            echo "curl failed contacting $url"; return 1; }
+
+        # HTTP/2 responses render as "HTTP/2 200", HTTP/1.1 as "HTTP/1.1 200 OK";
+        # field 2 is the status in both. -L means several may appear, so take the last.
+        status=$(printf '%s' "$headers" | grep -E '^HTTP/' | tail -1 | awk '{print $2}')
+        [ "$status" = "200" ] || { echo "$url returned HTTP ${status:-?}"; return 1; }
+
+        last_mod=$(printf '%s' "$headers" | grep -i '^last-modified:' \
+                   | sed 's/^[Ll]ast-[Mm]odified:[[:space:]]*//' | tr -d '\r' | tail -1)
+        [ -n "$last_mod" ] || { echo "Last-Modified header missing for $url"; return 1; }
+
+        last_epoch=$(date -d "$last_mod" +%s 2>/dev/null) || {
+            echo "Last-Modified parse failed for $url: $last_mod"; return 1; }
+
+        now_epoch=$(date +%s)
+        age_sec=$((now_epoch - last_epoch))
+        age_min=$((age_sec / 60))
+
+        [ "$age_sec" -le "$MAX_STALE_SEC" ] || {
+            echo "$url is ${age_min}m stale (>$((MAX_STALE_SEC / 60))m threshold)"; return 1; }
+
+        log "OK  $url  status=$status age=${age_min}m"
+    done <<< "$FEED_URLS"
+    return 0
+}
+
+# Two independent channels, both optional — configure either or both in $CONF.
+# Neither is ever fatal: a failed notification must not mask the underlying
+# result in the exit code, and must not stop the OTHER channel being tried.
+#
+#   Pushover  — sub-second push, the right channel for "act now".
+#   Email     — slower and easier to miss, but it lands in the same mailbox as
+#               the poseidon digests, so alerts sit alongside their context.
+notify() {
+    local title="$1" message="$2" priority="${3:-1}"
+    local sent=0
+
+    # priority=1 bypasses Pushover quiet hours but needs no acknowledgment
+    # (priority=2 demands ack — reserved for must-act-now).
+    if [ -n "${PUSHOVER_USER_KEY:-}" ] && [ -n "${PUSHOVER_APP_TOKEN:-}" ]; then
+        local http
+        http=$(curl -s --max-time 10 \
+            --form-string "token=$PUSHOVER_APP_TOKEN" \
+            --form-string "user=$PUSHOVER_USER_KEY" \
+            --form-string "title=$title" \
+            --form-string "message=$message" \
+            --form-string "priority=$priority" \
+            https://api.pushover.net/1/messages.json \
+            -o /dev/null -w '%{http_code}') || http="curl-failed"
+        log "pushover: HTTP $http"
+        sent=1
+    fi
+
+    # Uses the same Proton relay and account name as poseidon's digests, so
+    # /etc/msmtprc is a straight copy of the one there (see epicenter-server
+    # deploy/scripts/setup-msmtp.sh).
+    if [ -n "${ALERT_EMAIL:-}" ] && command -v msmtp >/dev/null 2>&1; then
+        if printf 'From: %s\nTo: %s\nSubject: %s\n\n%s\n' \
+                "${ALERT_FROM:-info@odysseymaps.io}" "$ALERT_EMAIL" "$title" "$message" \
+           | msmtp -a "${MSMTP_ACCOUNT:-proton}" "$ALERT_EMAIL" 2>&1; then
+            log "email: sent to $ALERT_EMAIL"
+        else
+            log "email: FAILED to $ALERT_EMAIL (see /var/log/msmtp.log)"
+        fi
+        sent=1
+    fi
+
+    [ "$sent" -eq 0 ] && log "WARN no alert channel configured in $CONF — not sent: $title / $message"
+    return 0
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+PREV_STATUS=healthy
+PREV_ALERT=0
+if [ -r "$STATE_FILE" ]; then
+    IFS='	' read -r PREV_STATUS PREV_ALERT < "$STATE_FILE" || true
+    PREV_STATUS="${PREV_STATUS:-healthy}"
+    PREV_ALERT="${PREV_ALERT:-0}"
+fi
+
+REASON=$(check_feeds)
+RC=$?
+NOW=$(date +%s)
+STAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+if [ "$RC" -ne 0 ]; then
+    log "UNHEALTHY $REASON"
+    # Alert on the healthy->unhealthy edge, then at most once per REALERT_SEC.
+    if [ "$PREV_STATUS" != "unhealthy" ] || [ $((NOW - PREV_ALERT)) -ge "$REALERT_SEC" ]; then
+        notify "Epicenter CDN feed unhealthy" \
+               "Probe at $STAMP (seismology.rocks). Reason: $REASON. Check poseidon."
+        PREV_ALERT=$NOW
+    else
+        log "alert suppressed (last sent $(( (NOW - PREV_ALERT) / 60 ))m ago, re-alert every $((REALERT_SEC / 60))m)"
+    fi
+    printf 'unhealthy\t%s\n' "$PREV_ALERT" > "$STATE_FILE"
+    exit 1
+fi
+
+log "HEALTHY all feeds"
+# Recovery is worth a push: it closes the loop on an alert you already acted on.
+# priority=0 — informational, must not bypass quiet hours.
+if [ "$PREV_STATUS" = "unhealthy" ]; then
+    notify "Epicenter CDN feed recovered" "Recovered at $STAMP (seismology.rocks)." 0
+fi
+printf 'healthy\t0\n' > "$STATE_FILE"
+exit 0

@@ -1,0 +1,18 @@
+[Unit]
+Description=Run the Epicenter CDN feed probe every 5 minutes
+
+[Timer]
+# Offset from feed-builder, which publishes on poseidon at *:6/5 (minute 6, 11,
+# 16 …). Probing at 3, 8, 13 … lands mid-cycle rather than racing the upload.
+# The 15-minute staleness threshold makes the exact offset non-critical; this
+# just avoids reading a header while the object is being replaced.
+OnCalendar=*-*-* *:3/5:00
+# Small jitter so this never lines up exactly with anything else on the box.
+RandomizedDelaySec=20
+# Catch up after a reboot or a suspended VM rather than waiting for the next
+# slot — an outage during downtime is exactly when a probe should speak up.
+Persistent=true
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

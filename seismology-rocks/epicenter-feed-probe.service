@@ -1,0 +1,13 @@
+[Unit]
+Description=Epicenter CDN feed probe (external — runs OFF poseidon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/epicenter-feed-probe
+# A failing probe is the POINT of this unit, not a unit failure — exit 1 means
+# "the feed is unhealthy", which the script has already alerted on. Without
+# this, systemd marks the unit failed and it shows up in every list-units
+# --failed sweep, training you to ignore a genuinely red unit.
+SuccessExitStatus=0 1

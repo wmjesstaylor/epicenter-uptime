@@ -65,6 +65,29 @@ touch /var/log/msmtp.log
 chown root:root /var/log/msmtp.log
 chmod 0600 /var/log/msmtp.log
 
+# AppArmor. Ubuntu's msmtp package ships /etc/apparmor.d/usr.bin.msmtp, which
+# confines msmtp EVEN AS ROOT. Its rule is
+#
+#   /var/log/msmtp    wk,
+#
+# — note the missing .log — so writing /var/log/msmtp.log is denied and msmtp
+# reports it as a bare "Permission denied", which reads like a file-mode problem
+# and is not. Mail still SENDS (exitcode=EX_OK); only logging fails.
+#
+# local/ is the sanctioned place to extend a packaged profile, and it ships
+# empty. Adding the path here survives package upgrades, unlike editing the
+# profile itself.
+LOCAL_AA=/etc/apparmor.d/local/usr.bin.msmtp
+if [ -d "$(dirname "$LOCAL_AA")" ] && ! grep -qs '/var/log/msmtp\.log' "$LOCAL_AA"; then
+    echo "=== allowing /var/log/msmtp.log in the AppArmor local override ==="
+    printf '# Added by epicenter-uptime setup-msmtp.sh — the packaged profile\n# only allows /var/log/msmtp (no .log), which our logfile= setting uses.\n/var/log/msmtp.log wk,\n' >> "$LOCAL_AA"
+    if command -v apparmor_parser >/dev/null 2>&1; then
+        apparmor_parser -r /etc/apparmor.d/usr.bin.msmtp 2>/dev/null \
+            && echo "  profile reloaded" \
+            || echo "  WARNING: profile reload failed — reboot or run: apparmor_parser -r /etc/apparmor.d/usr.bin.msmtp"
+    fi
+fi
+
 echo
 echo "=== next ==="
 echo "1. Fill in the two credential fields:   sudo nano /etc/msmtprc"

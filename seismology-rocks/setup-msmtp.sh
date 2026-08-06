@@ -43,7 +43,12 @@ auth           on
 tls            on
 tls_starttls   on
 tls_trust_file /etc/ssl/certs/ca-certificates.crt
-logfile        /var/log/msmtp.log
+# /var/log/msmtp WITHOUT .log — that is the exact path Ubuntu's packaged
+# AppArmor profile allows (`/var/log/msmtp wk,`). Using .log here is denied even
+# as root, and msmtp reports it as a bare "Permission denied". Poseidon uses
+# .log and gets away with it; this box does not, so match the profile rather
+# than fight it.
+logfile        /var/log/msmtp
 
 account        proton
 host           smtp.protonmail.ch
@@ -61,9 +66,9 @@ EOF
 fi
 ls -l /etc/msmtprc
 
-touch /var/log/msmtp.log
-chown root:root /var/log/msmtp.log
-chmod 0600 /var/log/msmtp.log
+touch /var/log/msmtp
+chown root:root /var/log/msmtp
+chmod 0600 /var/log/msmtp
 
 # AppArmor. Ubuntu's msmtp package ships /etc/apparmor.d/usr.bin.msmtp, which
 # confines msmtp EVEN AS ROOT. Its rule is
@@ -93,7 +98,7 @@ echo "=== next ==="
 echo "1. Fill in the two credential fields:   sudo nano /etc/msmtprc"
 echo "2. Test:"
 echo "     printf 'Subject: msmtp test\\n\\nworks\\n' | msmtp -a proton seismology.rocks@protonmail.com"
-echo "     sudo tail -5 /var/log/msmtp.log"
+echo "     sudo tail -5 /var/log/msmtp"
 echo "3. Point the probe at email:            sudo nano /etc/epicenter-feed-probe.env"
 echo "     set ALERT_EMAIL=seismology.rocks@protonmail.com"
 echo

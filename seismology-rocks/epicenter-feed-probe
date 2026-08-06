@@ -111,18 +111,36 @@ notify() {
         sent=1
     fi
 
-    # Uses the same Proton relay and account name as poseidon's digests, so
-    # /etc/msmtprc is a straight copy of the one there (see epicenter-server
-    # deploy/scripts/setup-msmtp.sh).
-    if [ -n "${ALERT_EMAIL:-}" ] && command -v msmtp >/dev/null 2>&1; then
-        if printf 'From: %s\nTo: %s\nSubject: %s\n\n%s\n' \
-                "${ALERT_FROM:-info@odysseymaps.io}" "$ALERT_EMAIL" "$title" "$message" \
-           | msmtp -a "${MSMTP_ACCOUNT:-proton}" "$ALERT_EMAIL" 2>&1; then
-            log "email: sent to $ALERT_EMAIL"
+    # Prefer msmtp (same Proton relay + account name as poseidon's digests, so
+    # /etc/msmtprc is a straight copy of the one there — see epicenter-server
+    # deploy/scripts/setup-msmtp.sh). Fall back to sendmail, which postfix
+    # provides, for boxes that already have a working MTA.
+    #
+    # NOTE a stock droplet postfix (relayhost empty, myhostname still the image
+    # default) delivers direct-to-MX with no SPF/DKIM/rDNS — Proton will very
+    # likely reject or spam-folder that. Presence of sendmail is NOT proof mail
+    # works; verify with a real send before trusting this channel.
+    if [ -n "${ALERT_EMAIL:-}" ]; then
+        local body
+        body=$(printf 'From: %s\nTo: %s\nSubject: %s\n\n%s\n' \
+                      "${ALERT_FROM:-info@odysseymaps.io}" "$ALERT_EMAIL" "$title" "$message")
+        if command -v msmtp >/dev/null 2>&1; then
+            if printf '%s\n' "$body" | msmtp -a "${MSMTP_ACCOUNT:-proton}" "$ALERT_EMAIL" 2>&1; then
+                log "email: sent to $ALERT_EMAIL via msmtp"
+            else
+                log "email: FAILED to $ALERT_EMAIL via msmtp (see /var/log/msmtp.log)"
+            fi
+            sent=1
+        elif command -v sendmail >/dev/null 2>&1; then
+            if printf '%s\n' "$body" | sendmail -t 2>&1; then
+                log "email: handed to sendmail for $ALERT_EMAIL (queued — check /var/log/mail.log for actual delivery)"
+            else
+                log "email: FAILED handing to sendmail for $ALERT_EMAIL"
+            fi
+            sent=1
         else
-            log "email: FAILED to $ALERT_EMAIL (see /var/log/msmtp.log)"
+            log "email: ALERT_EMAIL set but no msmtp or sendmail on this host"
         fi
-        sent=1
     fi
 
     [ "$sent" -eq 0 ] && log "WARN no alert channel configured in $CONF — not sent: $title / $message"

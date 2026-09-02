@@ -39,8 +39,30 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-SITE_URL=https://seismology.rocks/
-ACME_WEBROOT=/var/www/ghost/system/nginx-root
+# ── Per-host configuration ────────────────────────────────────────────
+# Defaults describe seismology.rocks (the blog). Override by environment to use
+# this on another droplet — poseidon and poseidon-staging serve an API, not a
+# site, so their health URL and expected status differ:
+#
+#   LOCKDOWN_SITE_URL=https://notifications.seismology.rocks/api/v1/notifications/register-device \
+#   LOCKDOWN_OK_REGEX='^(405|2[0-9][0-9]|3[0-9][0-9])$' \
+#   LOCKDOWN_ACME_WEBROOT= \
+#       sudo -E ./setup-origin-lockdown.sh
+#
+# Why 405 counts as healthy there: register-device is POST-only, so a GET
+# returning 405 proves nginx routed the request and the app answered. Checking
+# "/" would only prove nginx is up — and on poseidon "/" is a 404, which is
+# indistinguishable from the app being down.
+SITE_URL="${LOCKDOWN_SITE_URL:-https://seismology.rocks/}"
+
+# Which HTTP statuses mean "this origin is healthy". Deliberately a regex and
+# not "any 4xx": a blanket 4xx would accept a 403 from Cloudflare blocking us,
+# which is precisely the failure this check exists to notice.
+OK_REGEX="${LOCKDOWN_OK_REGEX:-^(2[0-9][0-9]|3[0-9][0-9])$}"
+
+# Empty = no ACME check (poseidon uses a Cloudflare Origin CA certificate valid
+# to 2041, so it has no Let's Encrypt renewal to protect).
+ACME_WEBROOT="${LOCKDOWN_ACME_WEBROOT-/var/www/ghost/system/nginx-root}"
 V4=/etc/cloudflare/ips-v4
 V6=/etc/cloudflare/ips-v6
 MARKER=/etc/cloudflare/lockdown-enabled
@@ -95,10 +117,12 @@ log "using $V4_COUNT IPv4 and $V6_COUNT IPv6 Cloudflare ranges"
 # If it is already broken, a post-flight failure would be blamed on this script
 # and trigger a pointless rollback.
 baseline=$(curl -4 -sS --max-time 20 -o /dev/null -w '%{http_code}' "$SITE_URL" 2>/dev/null || echo 000)
-case "$baseline" in
-    2*|3*) log "baseline: site returns HTTP $baseline through Cloudflare" ;;
-    *) echo "baseline check FAILED (HTTP $baseline) — the site is not healthy before the change; fix that first" >&2; exit 1 ;;
-esac
+if [[ "$baseline" =~ $OK_REGEX ]]; then
+    log "baseline: origin returns HTTP $baseline through Cloudflare"
+else
+    echo "baseline check FAILED (HTTP $baseline, expected $OK_REGEX) — not healthy before the change; fix that first" >&2
+    exit 1
+fi
 
 backup_rules
 
@@ -199,10 +223,11 @@ sleep 3
 FAIL=""
 
 site=$(curl -4 -sS --max-time 25 -o /dev/null -w '%{http_code}' "$SITE_URL" 2>/dev/null || echo 000)
-case "$site" in
-    2*|3*) log "post-flight: site OK through Cloudflare (HTTP $site)" ;;
-    *) FAIL="site returned HTTP $site through Cloudflare" ;;
-esac
+if [[ "$site" =~ $OK_REGEX ]]; then
+    log "post-flight: origin OK through Cloudflare (HTTP $site)"
+else
+    FAIL="origin returned HTTP $site through Cloudflare (expected $OK_REGEX)"
+fi
 
 # Exercise the real certificate-renewal path rather than reasoning about it: put
 # a token in the ACME webroot and fetch it over plain HTTP through Cloudflare,

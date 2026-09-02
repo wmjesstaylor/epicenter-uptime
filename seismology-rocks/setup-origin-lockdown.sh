@@ -245,6 +245,12 @@ if [ -z "$FAIL" ] && [ -d "$ACME_WEBROOT" ]; then
     else
         FAIL="ACME challenge path is not reachable through Cloudflare (cert renewal would fail in October)"
     fi
+elif [ -z "$FAIL" ] && [ -z "$ACME_WEBROOT" ]; then
+    # Explicitly disabled for this host. Not a warning — poseidon and staging use
+    # a Cloudflare Origin CA certificate (valid to 2041) and have no ACME
+    # renewal to protect. Saying "WARN: not found" there implies something is
+    # missing when nothing is.
+    log "ACME check skipped (no webroot configured for this host)"
 elif [ -z "$FAIL" ]; then
     log "WARN: $ACME_WEBROOT not found — could not verify the renewal path"
 fi

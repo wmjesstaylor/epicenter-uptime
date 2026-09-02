@@ -21,6 +21,11 @@
 #                                     see, and the reason this exists at all)
 #   - Cloudflare / R2 / DNS incident (curl error, non-2xx, routing break)
 #
+# EVERY ALERT IS CONFIRMED BY A SECOND CHECK before it pushes (see the retry
+# block). A lone transient failure is logged and dropped, because on this box
+# the most likely cause of one is the box's own DNS, not the feed. Requests are
+# IPv4-only on purpose — see the -4 comment in check_feeds.
+#
 # Config lives in /etc/epicenter-feed-probe.env (0600, root) — it holds the
 # Pushover credentials and is deliberately NOT in this public repo.
 set -uo pipefail
@@ -45,20 +50,57 @@ MAX_STALE_SEC="${MAX_STALE_SEC:-900}"
 # quietly stops being a monitor.
 REALERT_SEC="${REALERT_SEC:-3600}"
 
+# One transient failure must not page anyone. On any failure the check is run
+# again after this delay, and only a SECOND failure alerts. See the retry block
+# further down for why this is safe against the staleness check.
+RETRY_DELAY="${RETRY_DELAY:-10}"
+
 STATE_DIR="${STATE_DIR:-/var/lib/epicenter-feed-probe}"
 STATE_FILE="$STATE_DIR/state"
 
 log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
+# curl's exit code is the difference between "DNS is broken", "the host is
+# unreachable" and "it was just slow" — three different problems that all used
+# to log as the single useless string "curl failed contacting <url>". On
+# 2026-09-02 that ambiguity cost an hour: the one recorded failure could not be
+# attributed without re-deriving the cause from unrelated evidence. Name it.
+curl_reason() {
+    case "$1" in
+        5)  echo "couldn't resolve proxy" ;;
+        6)  echo "DNS: couldn't resolve host" ;;
+        7)  echo "couldn't connect" ;;
+        28) echo "timed out" ;;
+        35) echo "TLS handshake failed" ;;
+        56) echo "connection reset while receiving" ;;
+        *)  echo "see curl(1) exit codes" ;;
+    esac
+}
+
 # Echoes a human reason and returns 1 on the first unhealthy feed; silent + 0
 # when every feed passes. Checks are ordered cheapest-first.
 check_feeds() {
-    local url headers status last_mod last_epoch now_epoch age_sec age_min
+    local url headers status last_mod last_epoch now_epoch age_sec age_min rc
     while IFS= read -r url; do
         [ -z "$url" ] && continue
 
-        headers=$(curl -sIL --max-time 30 "$url") || {
-            echo "curl failed contacting $url"; return 1; }
+        # -4 is deliberate. This droplet has NO IPv6 address and NO IPv6 default
+        # route (checked across poseidon, poseidon-staging and here on
+        # 2026-09-02 — all three are IPv4-only), yet Cloudflare publishes AAAA
+        # records for these hostnames. Without -4 every check also asks for an
+        # AAAA record it can never use and opens a connection that can only
+        # fail: half the DNS queries, aimed at resolvers that are measurably
+        # flaky (see the retry block), for nothing.
+        #
+        # This is NOT a workaround for missing IPv6 — it is a decision. Origin
+        # IPv6 buys nothing here: every client-facing hostname is already
+        # dual-stack at Cloudflare, so IPv6-only clients reach the feed over
+        # IPv6 today and Cloudflare speaks IPv4 to the origin. Half-working
+        # IPv6 is worse than none: it fails slowly instead of instantly.
+        # Revisit ONLY if we stop fronting these hostnames with Cloudflare.
+        headers=$(curl -4 -sIL --max-time 30 "$url"); rc=$?
+        [ "$rc" -eq 0 ] || {
+            echo "curl failed contacting $url (exit $rc: $(curl_reason "$rc"))"; return 1; }
 
         # HTTP/2 responses render as "HTTP/2 200", HTTP/1.1 as "HTTP/1.1 200 OK";
         # field 2 is the status in both. -L means several may appear, so take the last.
@@ -159,6 +201,50 @@ fi
 
 REASON=$(check_feeds)
 RC=$?
+
+# ── Confirm before crying wolf ────────────────────────────────────────
+# A single failed check is not evidence of an outage. On 2026-09-02 at 14:33
+# this probe paged over one stalled DNS lookup: it was the ONLY failure in 27
+# days and ~7,700 runs, the feed was being published normally throughout, and
+# the next check five minutes later passed. A pure false positive.
+#
+# The cause is chronic and lives on this box, not in the feed. DigitalOcean's
+# resolvers (67.207.67.2/.3) intermittently mishandle EDNS0, so systemd-resolved
+# downgrades them UDP+EDNS0 -> UDP -> TCP — 199 times in nine months of journal,
+# on EVERY day of the two weeks before that failure, and it was mid-downgrade
+# when the probe tripped. In TCP mode a lookup can stall for many seconds and
+# give up; that is what a "curl failed" here usually means.
+#
+# The probe's DNS cache cannot absorb this: Cloudflare's TTL (~300s) matches the
+# probe interval, so nearly every run resolves live — 35,655 cache misses against
+# 4,266 hits. Every single check is a fresh roll of the dice against those
+# resolvers. Fixing the resolvers is the real remedy; this retry is the seatbelt.
+#
+# SAFE AGAINST THE STALENESS CHECK. A genuinely stale feed is still stale ten
+# seconds later, so a real outage still alerts on this same run — the retry only
+# absorbs faults that resolve within it. And a real outage lasts far longer than
+# MAX_STALE_SEC (15 min = 3 missed builder cycles) anyway, so nothing that
+# matters is detected meaningfully later.
+if [ "$RC" -ne 0 ]; then
+    FIRST_REASON="$REASON"
+    log "TRANSIENT $FIRST_REASON — re-checking in ${RETRY_DELAY}s before alerting"
+    sleep "$RETRY_DELAY"
+    REASON=$(check_feeds)
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+        # Worth a line: these are the near-misses. If they become frequent,
+        # the resolvers (or the network) are degrading and the retry is
+        # masking it — that is the signal to go fix the cause, not the knob.
+        log "RECOVERED on re-check — not alerting. First failure was: $FIRST_REASON"
+    elif [ "$REASON" = "$FIRST_REASON" ]; then
+        log "CONFIRMED after re-check: $REASON"
+    else
+        # Two different reasons in ten seconds is itself informative — e.g. DNS
+        # failing and then a 5xx says something broader than either alone.
+        log "CONFIRMED after re-check: $REASON (first failure differed: $FIRST_REASON)"
+    fi
+fi
+
 NOW=$(date +%s)
 STAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
 
@@ -167,7 +253,7 @@ if [ "$RC" -ne 0 ]; then
     # Alert on the healthy->unhealthy edge, then at most once per REALERT_SEC.
     if [ "$PREV_STATUS" != "unhealthy" ] || [ $((NOW - PREV_ALERT)) -ge "$REALERT_SEC" ]; then
         notify "Epicenter CDN feed unhealthy" \
-               "Probe at $STAMP (seismology.rocks). Reason: $REASON. Check poseidon."
+               "Probe at $STAMP (seismology.rocks), confirmed on re-check ${RETRY_DELAY}s apart. Reason: $REASON. Check poseidon."
         PREV_ALERT=$NOW
     else
         log "alert suppressed (last sent $(( (NOW - PREV_ALERT) / 60 ))m ago, re-alert every $((REALERT_SEC / 60))m)"

@@ -32,9 +32,12 @@
 #     PermitRootLogin no (poseidon 2026-04-29, staging 2026-05-30, seismology in
 #     its main sshd_config). The agent does its part — it detects the port knock
 #     and installs the DOTTY keys — and then sshd refuses the root login.
-# The real out-of-band path is the DO *Recovery* Console (hypervisor-level),
-# which needs a root password that actually exists. Worth setting up and storing
-# deliberately, BEFORE it is needed — that is the whole point of break-glass.
+# THE FALLBACK THAT DOES WORK is the DO *Recovery* Console: hypervisor-level,
+# so it survives a dead sshd, a wrong firewall rule or a broken network config.
+# Confirmed available 2026-09-02, and credentials exist for both routes — root
+# passwords for all three boxes are in 1Password, and jess has a password set on
+# all three (passwd -S reports P), so jess + sudo works too. Reach for THAT, not
+# the Droplet Console.
 #
 # CERTIFICATE RENEWAL. acme.sh renews via webroot HTTP-01 at
 # /var/www/ghost/system/nginx-root (next due 2026-10-29). Let's Encrypt

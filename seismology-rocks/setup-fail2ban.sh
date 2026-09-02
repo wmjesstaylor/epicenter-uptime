@@ -84,9 +84,9 @@ cat > "$JAIL" <<'EOF'
 # the Droplet Console is NOT out-of-band (it is SSH to port 22 as root, set up
 # by droplet-agent), and it cannot work here because every box sets
 # PermitRootLogin no — since 2026-04-29 on poseidon, 2026-05-30 on staging.
-# The genuinely out-of-band path is the DO *Recovery* Console, which needs a
-# root password you can actually produce. See the note in
-# setup-origin-lockdown.sh.
+# The working fallback is the DO *Recovery* Console (hypervisor-level, survives
+# a dead sshd), and the credentials for it exist — root passwords in 1Password,
+# plus a set password for jess on all three boxes. See setup-origin-lockdown.sh.
 ignoreip = 127.0.0.1/8 ::1
 
 # The stock 10m/10m/5 catches a single loud host. It does not catch a botnet

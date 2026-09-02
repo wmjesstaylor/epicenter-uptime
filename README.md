@@ -141,3 +141,45 @@ two together form the operational alerting layer:
 
 Either firing means the operator should investigate. Both firing
 simultaneously means a real production incident.
+
+## Host configuration scripts (seismology-rocks/)
+
+Beyond the probe itself, this directory holds the host-hardening scripts applied
+on 2026-09-02. All are idempotent and all support `--revert`.
+
+| Script | What it does |
+|---|---|
+| `setup-fail2ban.sh` | Retunes fail2ban for a distributed botnet rather than one loud host, plus `recidive` and `dbpurgeage=5w` |
+| `setup-cloudflare-realip.sh` + `cloudflare-ips-refresh` | nginx `real_ip` so logs show real visitors, on a validated weekly-refreshed copy of Cloudflare's ranges |
+| `setup-origin-lockdown.sh` | Restricts 80/443 to Cloudflare, so the origin cannot be reached directly |
+| `setup-dns-resolvers.sh` | Replaces DigitalOcean's DNS resolvers with Cloudflare + Google |
+
+### ⚠️ Before changing ANY droplet networking
+
+`setup-dns-resolvers.sh` writes `/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg`,
+because cloud-init otherwise regenerates `50-cloud-init.yaml` on every reboot and
+restores the DigitalOcean resolvers.
+
+**So DigitalOcean control-panel network changes no longer reach the droplet
+automatically** — enabling IPv6, adding a floating IP, adding a VPC interface.
+If you change a droplet's networking in the panel, either run `--revert` first or
+re-run the script afterwards and add the new interface by hand. Applied on all
+three droplets (poseidon, poseidon-staging, seismology.rocks). Pristine netplan
+backups live in `/var/backups/netplan/`.
+
+### Three traps these scripts exist to work around
+
+All three produced a config that looked applied and was not, with no error in any
+log. Each is guarded by a count assertion now — the comments in each script carry
+the full detail.
+
+1. **netplan merges nameserver lists** rather than replacing them, so a `99-*.yaml`
+   drop-in leaves the old resolvers in place and first in line.
+2. **systemd drop-ins append to `DNS=`**, and `99-` sorts *before* `DigitalOcean.conf`
+   (strcmp: `9` < `D`). Use a `zz-` prefix; "99 means last" only holds while every
+   filename is numeric.
+3. **Cloudflare's published IP lists have no trailing newline**, so `while read`
+   silently drops the final range. Harmless in nginx, an outage in the firewall.
+
+The general lesson: verifying the generated artifact is not verifying the running
+behaviour. Assert on running state, and count what you produced.

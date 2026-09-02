@@ -77,8 +77,16 @@ cat > "$JAIL" <<'EOF'
 # Never ban the loopback. Deliberately NOT adding a home/office IP: this box is
 # key-only (PasswordAuthentication no), so a legitimate operator does not
 # generate auth failures, and a hardcoded "safe" IP is a standing hole that
-# outlives whoever added it. If you do lock yourself out, use the DigitalOcean
-# web console — it is out-of-band and unaffected by any of this.
+# outlives whoever added it.
+#
+# NOTE ON LOCKOUT RECOVERY — this used to say "use the DigitalOcean web
+# console, it is out-of-band". BOTH HALVES WERE WRONG, checked 2026-09-02:
+# the Droplet Console is NOT out-of-band (it is SSH to port 22 as root, set up
+# by droplet-agent), and it cannot work here because every box sets
+# PermitRootLogin no — since 2026-04-29 on poseidon, 2026-05-30 on staging.
+# The genuinely out-of-band path is the DO *Recovery* Console, which needs a
+# root password you can actually produce. See the note in
+# setup-origin-lockdown.sh.
 ignoreip = 127.0.0.1/8 ::1
 
 # The stock 10m/10m/5 catches a single loud host. It does not catch a botnet

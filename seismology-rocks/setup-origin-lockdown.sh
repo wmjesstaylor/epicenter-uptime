@@ -21,8 +21,20 @@
 # this script to leave the blog unreachable.
 #
 # SSH IS DELIBERATELY UNTOUCHED. Port 22 keeps its existing rules. Cloudflare
-# does not proxy SSH, so restricting it here would lock you out of the box. The
-# DigitalOcean web console is out-of-band and works regardless.
+# does not proxy SSH, so restricting it here would lock you out of the box.
+#
+# DO NOT COUNT ON THE DIGITALOCEAN WEB CONSOLE AS THE FALLBACK. An earlier
+# version of this comment called it "out-of-band and works regardless"; that was
+# wrong on both counts, established 2026-09-02 while it was failing for real:
+#   - The Droplet Console is SSH to port 22 as root, brokered by droplet-agent.
+#     It is in-band, and a firewall or sshd change CAN break it.
+#   - It is already broken on all three droplets, because each sets
+#     PermitRootLogin no (poseidon 2026-04-29, staging 2026-05-30, seismology in
+#     its main sshd_config). The agent does its part — it detects the port knock
+#     and installs the DOTTY keys — and then sshd refuses the root login.
+# The real out-of-band path is the DO *Recovery* Console (hypervisor-level),
+# which needs a root password that actually exists. Worth setting up and storing
+# deliberately, BEFORE it is needed — that is the whole point of break-glass.
 #
 # CERTIFICATE RENEWAL. acme.sh renews via webroot HTTP-01 at
 # /var/www/ghost/system/nginx-root (next due 2026-10-29). Let's Encrypt

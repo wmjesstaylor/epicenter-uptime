@@ -53,7 +53,18 @@ fi
 
 NETPLAN=/etc/netplan/50-cloud-init.yaml
 CLOUD_INIT_DISABLE=/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
-RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/99-dns-resolvers.conf
+# NAME MATTERS. systemd applies drop-ins in strcmp order, and '9' (0x39) sorts
+# BEFORE 'D' (0x44) — so a 99-*.conf is applied BEFORE DigitalOcean.conf, which
+# then re-adds its servers after ours. That is exactly what happened on the
+# first attempt here: the global scope came back as
+#     1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 67.207.67.2 67.207.67.3
+# The conventional "99 means last" habit is wrong once a filename starts with a
+# letter. 'zz-' sorts after any capitalised vendor file.
+RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/zz-dns-resolvers.conf
+# Older name, from before the sort-order bug was understood. Removed on sight so
+# a re-run does not leave a stale file contributing to the merged config.
+RESOLVED_DROPIN_OLD=/etc/systemd/resolved.conf.d/99-dns-resolvers.conf
+MANAGED_MARKER="Rewritten by setup-dns-resolvers.sh"
 BACKUP_DIR=/var/backups/netplan
 STAMP=$(date -u '+%Y%m%d-%H%M%S')
 
@@ -90,12 +101,29 @@ verify_resolution() {
     return 0
 }
 
+# Check what resolved is ACTUALLY using, across every scope including global.
+# The generated-config assertion above covers the per-link servers but says
+# nothing about resolved.conf.d — and the first run here passed that assertion
+# while the global scope still listed both DO resolvers. Assert on the running
+# state, because that is the thing that answers queries.
+verify_no_do_resolvers() {
+    local found
+    found=$(resolvectl status 2>/dev/null | grep -c "$DO_RESOLVER_PATTERN" || true)
+    if [ "${found:-0}" -ne 0 ]; then
+        log "FAILED: DigitalOcean resolvers still present in the running config"
+        resolvectl status 2>/dev/null | grep -E "Current DNS Server|DNS Servers" | sed 's/^/    /'
+        return 1
+    fi
+    log "running config OK: no DigitalOcean resolvers in any scope"
+    return 0
+}
+
 restore_backup() {
     local stamp="$1"
     [ -f "$BACKUP_DIR/50-cloud-init.yaml.$stamp" ] || { log "no backup $stamp"; return 1; }
     cp -a "$BACKUP_DIR/50-cloud-init.yaml.$stamp" "$NETPLAN"
     chmod 0600 "$NETPLAN" 2>/dev/null || true
-    rm -f "$CLOUD_INIT_DISABLE" "$RESOLVED_DROPIN"
+    rm -f "$CLOUD_INIT_DISABLE" "$RESOLVED_DROPIN" "$RESOLVED_DROPIN_OLD"
     apply_config
     log "restored $NETPLAN from $stamp and re-enabled cloud-init networking"
 }
@@ -115,9 +143,33 @@ python3 -c 'import yaml' 2>/dev/null || { echo "python3 + PyYAML required" >&2; 
 [ -f "$NETPLAN" ] || { echo "$NETPLAN not found" >&2; exit 1; }
 
 mkdir -p "$BACKUP_DIR"
-cp -a "$NETPLAN" "$BACKUP_DIR/50-cloud-init.yaml.$STAMP"
-echo "$STAMP" > "$BACKUP_DIR/latest"
-log "backed up $NETPLAN -> $BACKUP_DIR/50-cloud-init.yaml.$STAMP"
+
+# NEVER back up a file this script already rewrote. On the second run here it
+# did exactly that, so "latest" pointed at the MODIFIED config and --revert
+# would have restored our own changes as if they were the original — the
+# DigitalOcean resolvers would have been unrecoverable from backups.
+#
+# A backup you cannot roll back to is worse than none: it reports safety it does
+# not provide. So: the pristine backup is the newest one WITHOUT our marker, and
+# a re-run keeps pointing at it rather than burying it under fresh copies.
+if grep -q "$MANAGED_MARKER" "$NETPLAN" 2>/dev/null; then
+    PRISTINE=$(
+        ls -1t "$BACKUP_DIR"/50-cloud-init.yaml.* 2>/dev/null | while IFS= read -r f; do
+            grep -q "$MANAGED_MARKER" "$f" 2>/dev/null || { echo "$f"; break; }
+        done
+    )
+    if [ -n "$PRISTINE" ]; then
+        STAMP="${PRISTINE##*.}"
+        echo "$STAMP" > "$BACKUP_DIR/latest"
+        log "already managed by this script; pristine backup retained: $STAMP"
+    else
+        log "WARN already managed but no pristine backup found — revert will not restore DO resolvers"
+    fi
+else
+    cp -a "$NETPLAN" "$BACKUP_DIR/50-cloud-init.yaml.$STAMP"
+    echo "$STAMP" > "$BACKUP_DIR/latest"
+    log "backed up $NETPLAN -> $BACKUP_DIR/50-cloud-init.yaml.$STAMP"
+fi
 
 # Edit with a YAML parser, not sed. The file has nested per-interface blocks and
 # the indentation is load-bearing; a regex that works on one droplet will not
@@ -166,11 +218,21 @@ echo "network: {config: disabled}" > "$CLOUD_INIT_DISABLE"
 
 # Global resolved config too, so nothing falls back to a resolver we rejected.
 log "writing $RESOLVED_DROPIN"
+rm -f "$RESOLVED_DROPIN_OLD"
 mkdir -p "$(dirname "$RESOLVED_DROPIN")"
 {
     echo "# Managed by setup-dns-resolvers.sh (epicenter-uptime repo)."
-    echo "# Sorts after DigitalOcean.conf, so these values win."
+    echo "# Named zz- so it sorts AFTER DigitalOcean.conf (strcmp: 9 < D)."
+    echo "#"
+    echo "# The bare 'DNS=' below is NOT redundant. systemd drop-ins APPEND to"
+    echo "# list-valued settings; assigning the empty string is the documented way"
+    echo "# to reset the list first. Without it the global scope ends up as:"
+    echo "#     DNS Servers: 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 67.207.67.2 67.207.67.3"
+    echo "# which is what happened on the first run here — the DO resolvers survive"
+    echo "# as a fallback path, in a file whose whole purpose is removing them."
+    echo "# Same silent-merge trap as netplan nameservers; different subsystem."
     echo "[Resolve]"
+    echo "DNS="
     echo "DNS=$RESOLVERS"
     echo "FallbackDNS="
 } > "$RESOLVED_DROPIN"
@@ -207,6 +269,12 @@ if ! verify_resolution; then
     log "REVERTING to DigitalOcean resolvers"
     restore_backup "$STAMP"
     verify_resolution && log "reverted and resolving again"
+    exit 1
+fi
+
+if ! verify_no_do_resolvers; then
+    log "REVERTING — the change did not actually take effect"
+    restore_backup "$STAMP"
     exit 1
 fi
 

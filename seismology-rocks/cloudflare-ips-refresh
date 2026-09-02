@@ -58,13 +58,25 @@ fetch() {
     rc=$?
     [ "$rc" -eq 0 ] || { log "fetch failed for $url (curl exit $rc)"; return 1; }
     [ -s "$out" ] || { log "fetch returned an empty body for $url"; return 1; }
+
+    # Cloudflare serves these lists with NO trailing newline, and `while read`
+    # discards a final unterminated line. That silently dropped the LAST range
+    # of each list on 2026-09-02 — 131.0.72.0/22 and 2c0f:f248::/32 — so the
+    # generated nginx trust list held 20 of 22 ranges and nobody would have
+    # noticed from the output, which cheerfully reported success.
+    #
+    # Harmless-looking here, an outage one script later: those are live edge
+    # ranges, and the firewall built from this same list would have refused
+    # every visitor routed through them. Normalise once, at the source, so
+    # every consumer of these files gets all of the data.
+    [ "$(tail -c1 "$out" | wc -l)" -eq 0 ] && printf '\n' >> "$out"
     return 0
 }
 
 # Every line must be a CIDR and nothing else. An HTML error page fails here.
 validate() {
     local file="$1" family="$2" min="$3" count=0 line
-    while IFS= read -r line; do
+    while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
         [ -z "$line" ] && continue
         if [ "$family" = "v4" ]; then
@@ -119,10 +131,10 @@ if [ -d /etc/nginx ]; then
         echo "# Regenerate: sudo cloudflare-ips-refresh --force"
         echo "# Last updated: $(date -u '+%Y-%m-%d %H:%M UTC')"
         echo
-        while IFS= read -r cidr; do
+        while IFS= read -r cidr || [ -n "$cidr" ]; do
             [ -n "$cidr" ] && echo "set_real_ip_from ${cidr%$'\r'};"
         done < "$V4"
-        while IFS= read -r cidr; do
+        while IFS= read -r cidr || [ -n "$cidr" ]; do
             [ -n "$cidr" ] && echo "set_real_ip_from ${cidr%$'\r'};"
         done < "$V6"
         echo
@@ -131,6 +143,18 @@ if [ -d /etc/nginx ]; then
         # nothing and would trust a chain we do not control.
         echo "real_ip_recursive off;"
     } > "$TMP/nginx.conf"
+
+    # Assert every range made it into the config. The trailing-newline bug was
+    # invisible precisely because the script reported success while emitting 20
+    # of 22 ranges — the output looked identical to a correct run. Anything that
+    # silently drops entries from a trust list must be caught by counting, not
+    # by reading the log. Cheap, and it fails closed.
+    WANT=$(( $(grep -c . "$V4") + $(grep -c . "$V6") ))
+    GOT=$(grep -c '^set_real_ip_from ' "$TMP/nginx.conf")
+    if [ "$WANT" -ne "$GOT" ]; then
+        die "generated $GOT set_real_ip_from directives but have $WANT ranges — refusing to install a partial trust list"
+    fi
+    log "trust list complete: $GOT of $WANT ranges"
 
     if [ -f "$NGINX_CONF" ] && cmp -s "$TMP/nginx.conf" "$NGINX_CONF" && [ "$FORCE" -eq 0 ]; then
         log "nginx real_ip config already current"

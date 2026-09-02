@@ -112,17 +112,33 @@ backup_rules
 # asymmetry wins. Audit occasionally with:
 #     sudo ufw status | grep cloudflare
 log "adding allow rules for Cloudflare ranges on 80,443"
-while IFS= read -r cidr; do
+while IFS= read -r cidr || [ -n "$cidr" ]; do
     cidr="${cidr%$'\r'}"; [ -z "$cidr" ] && continue
     ufw allow from "$cidr" to any port 80,443 proto tcp comment 'cloudflare' >/dev/null
 done < "$V4"
 
 if grep -qi '^IPV6=yes' /etc/default/ufw 2>/dev/null; then
-    while IFS= read -r cidr; do
+    while IFS= read -r cidr || [ -n "$cidr" ]; do
         cidr="${cidr%$'\r'}"; [ -z "$cidr" ] && continue
         ufw allow from "$cidr" to any port 80,443 proto tcp comment 'cloudflare' >/dev/null
     done < "$V6"
 fi
+
+# Assert every range actually became a rule BEFORE removing the world-open ones.
+# Ordering is the whole point: verify the replacement is complete while the old
+# rule is still in place, so a shortfall costs nothing. The same trailing-newline
+# bug that dropped two ranges from the nginx trust list would, here, have
+# firewalled off live Cloudflare edges — a partial outage visible only to
+# readers routed through them.
+CF_RULES=$(ufw status 2>/dev/null | grep -c 'cloudflare')
+EXPECTED=$V4_COUNT
+grep -qi '^IPV6=yes' /etc/default/ufw 2>/dev/null && EXPECTED=$(( V4_COUNT + V6_COUNT ))
+if [ "$CF_RULES" -lt "$EXPECTED" ]; then
+    log "only $CF_RULES Cloudflare rules present, expected $EXPECTED — NOT removing world-open rules"
+    restore_rules "$STAMP"
+    exit 1
+fi
+log "verified $CF_RULES Cloudflare allow rules in place (expected $EXPECTED)"
 
 # Now remove the rules that let the whole internet in on 80/443. Deleting by
 # number, highest first, because every deletion renumbers what follows.

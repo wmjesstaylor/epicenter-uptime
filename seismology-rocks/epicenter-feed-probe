@@ -58,7 +58,17 @@ RETRY_DELAY="${RETRY_DELAY:-10}"
 STATE_DIR="${STATE_DIR:-/var/lib/epicenter-feed-probe}"
 STATE_FILE="$STATE_DIR/state"
 
-log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+# >&2 is load-bearing. check_feeds returns its reason on STDOUT, captured by
+# REASON=$(check_feeds) — so anything log() writes to stdout gets spliced into
+# the alert text. On 2026-09-03 a genuine r2.dev HTTP 500 produced:
+#
+#   TRANSIENT 2026-09-03T12:13:25Z OK https://feed.seismology.rocks/... age=1m
+#   https://pub-...r2.dev/30day.geojson returned HTTP 500 — re-checking in 10s
+#
+# The per-URL "OK" line for the FIRST feed became the first line of the reason,
+# so the alert led with success and buried the actual cause underneath. journald
+# captures stderr just the same, so nothing is lost from the log by this.
+log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; }
 
 # curl's exit code is the difference between "DNS is broken", "the host is
 # unreachable" and "it was just slow" — three different problems that all used

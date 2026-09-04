@@ -167,6 +167,24 @@ re-run the script afterwards and add the new interface by hand. Applied on all
 three droplets (poseidon, poseidon-staging, seismology.rocks). Pristine netplan
 backups live in `/var/backups/netplan/`.
 
+### ⏰ Before upgrading seismology's OS
+
+**Run `setup-dns-resolvers.sh --revert` first.**
+
+This box carries a Cloudflare/Google resolver config that is correct on Ubuntu
+22.04 and **crashes systemd-resolved on 24.04** (AF_INET6 assertion in
+`resolved-dns-stream.c`; it cost poseidon and poseidon-staging 13 and 19
+core-dumps and a lost USGS poll on 2026-09-02, and both were reverted).
+
+The script's own 24.04 guard cannot help here: an OS upgrade never runs the
+script, it just leaves the config in place for the new systemd to read. Re-apply
+only if the bug is confirmed fixed, and watch
+`journalctl -u systemd-resolved -f | grep Assertion` afterwards.
+
+As a backstop, `epicenter-feed-probe` counts resolver core-dumps in the last
+hour and alerts if it finds any — a note is not a control. Ubuntu 22.04 standard
+support ends around April 2027.
+
 ### Three traps these scripts exist to work around
 
 All three produced a config that looked applied and was not, with no error in any

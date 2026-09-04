@@ -42,6 +42,31 @@
 # change a droplet's networking in the panel, re-run this script afterwards or
 # revert it first.
 #
+# ⛔ DO NOT RUN THIS ON UBUNTU 24.04. Verified the hard way on 2026-09-04.
+#
+# Pointing systemd 255 at Cloudflare/Google resolvers makes systemd-resolved
+# core-dump repeatedly:
+#
+#   Assertion 's->read_packet->family == AF_INET6' failed
+#     at src/resolve/resolved-dns-stream.c:399, function on_stream_io(). Aborting.
+#
+# Measured 38h after applying it: 13 crashes on poseidon, 19 on poseidon-staging,
+# ZERO before the change on either, and zero ever on seismology (22.04, journal
+# back to December). Rate ~1/hour and rising. It cost a real USGS poll — the
+# poller failed at 2026-09-03 01:55:10, ten seconds after a crash at 01:55:00.
+# systemd 255.4-1ubuntu8.17 is the newest Ubuntu ships; no update fixes it.
+#
+# Both 24.04 boxes were reverted with --revert on 2026-09-04. The change remains
+# on seismology (22.04), where the fault it fixes is severe (195 TCP escalations,
+# a 13-second stall that paged) and the crash does not occur.
+#
+# Check the OS before running:  . /etc/os-release; echo "$VERSION_ID"
+#
+# The wider lesson: applying this fleet-wide "for consistency" traded a
+# theoretical fault on the 24.04 boxes (5 downgrades, ZERO app-level DNS
+# failures in 14 days) for a real, accelerating one. The fleet is not uniform;
+# decide per box on that box's evidence.
+#
 # SSH IS NOT AT RISK. Even total DNS failure would not lock you out — sessions
 # reach these boxes by IP. The verification below still auto-reverts on failure.
 set -uo pipefail
@@ -136,6 +161,32 @@ if [ "${1:-}" = "--revert" ]; then
     verify_resolution
     resolvectl status 2>/dev/null | grep -E "Current DNS Server|DNS Servers" | head -4
     exit 0
+fi
+
+# ── Refuse on the OS where this is known to break ─────────────────────
+# A comment in a header is not a guard. This script was applied fleet-wide once
+# and broke two production boxes; the next person reaching for it will be
+# skim-reading, so make the script itself say no.
+OS_VERSION=$( . /etc/os-release 2>/dev/null && echo "${VERSION_ID:-unknown}" )
+if [ "$OS_VERSION" = "24.04" ] && [ "${ALLOW_UNSAFE_24_04:-}" != "yes" ]; then
+    cat >&2 <<'REFUSE'
+REFUSING: this host is Ubuntu 24.04.
+
+Pointing systemd 255 at Cloudflare/Google resolvers makes systemd-resolved
+core-dump repeatedly (AF_INET6 assertion in resolved-dns-stream.c). Measured
+2026-09-04: 13 crashes on poseidon, 19 on poseidon-staging, zero before the
+change, zero ever on 22.04. It cost a real USGS poll. No Ubuntu update fixes it.
+
+Both 24.04 boxes were reverted. If you are re-testing because a newer systemd
+may have fixed it, check the version first and then:
+
+    ALLOW_UNSAFE_24_04=yes sudo ./setup-dns-resolvers.sh
+
+and watch for the assertion:
+
+    journalctl -u systemd-resolved -f | grep Assertion
+REFUSE
+    exit 1
 fi
 
 command -v netplan  >/dev/null 2>&1 || { echo "netplan not found" >&2; exit 1; }

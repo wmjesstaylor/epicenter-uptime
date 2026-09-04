@@ -199,6 +199,61 @@ notify() {
     return 0
 }
 
+# ── Watch this host's DNS resolver for crashes ────────────────────────
+# WHY THIS LIVES IN THE FEED PROBE. Strictly this checks the HOST, not the feed.
+# It belongs here anyway for two reasons: this probe's own verdict depends on DNS
+# working (a resolver crash surfaces as "curl failed contacting <url>", which is
+# exactly the false alarm that started all of this on 2026-09-02), and this is
+# the only thing that runs every five minutes on this box with alerting already
+# wired up. Detecting the cause where the symptom appears closes the loop.
+#
+# WHAT IT IS LOOKING FOR. On Ubuntu 24.04 / systemd 255, pointing resolved at
+# Cloudflare or Google resolvers makes it core-dump repeatedly:
+#
+#   Assertion 's->read_packet->family == AF_INET6' failed
+#     at src/resolve/resolved-dns-stream.c:399
+#
+# That bit poseidon and poseidon-staging on 2026-09-02 (13 and 19 crashes, one
+# lost USGS poll) and both were reverted. THIS box is 22.04 and unaffected — but
+# it still carries the Cloudflare/Google config, because here the change fixed a
+# real fault and causes no crashes.
+#
+# THE TRAP THIS EXISTS FOR: when this box is eventually upgraded to 24.04 (22.04
+# standard support ends ~April 2027), the config is already in place and the
+# crashes simply begin. No script runs, so no apply-time guard can catch it, and
+# unlike poseidon this box has no health digest to surface the errors. This check
+# is what turns that from a months-long mystery into a named alert.
+#
+# Deliberately priority 0 (informational): a crashing resolver is serious but it
+# is not the feed being down, and it must not bypass quiet hours. Rate-limited by
+# its own state file so it cannot page every five minutes.
+check_resolver_health() {
+    command -v journalctl >/dev/null 2>&1 || return 0
+
+    local crashes state_file last_alert now
+    crashes=$(journalctl -u systemd-resolved --since "-1h" --no-pager 2>/dev/null \
+              | grep -cE "Assertion .*failed|result 'core-dump'" ) || crashes=0
+    [ "${crashes:-0}" -eq 0 ] && return 0
+
+    log "WARN systemd-resolved crashed ${crashes}x in the last hour on this host"
+
+    state_file="$STATE_DIR/resolver-alert"
+    last_alert=0
+    [ -r "$state_file" ] && read -r last_alert < "$state_file" 2>/dev/null
+    last_alert=${last_alert:-0}
+    now=$(date +%s)
+
+    if [ $((now - last_alert)) -ge "$REALERT_SEC" ]; then
+        notify "Epicenter host: DNS resolver crashing" \
+               "systemd-resolved core-dumped ${crashes}x in the last hour on $(hostname -s). Lookups fail while it restarts. If this box was recently upgraded to Ubuntu 24.04, the Cloudflare/Google resolver config is the known cause — run setup-dns-resolvers.sh --revert. See the epicenter-uptime repo." \
+               0
+        printf '%s\n' "$now" > "$state_file"
+    else
+        log "resolver alert suppressed (last sent $(( (now - last_alert) / 60 ))m ago)"
+    fi
+    return 0
+}
+
 mkdir -p "$STATE_DIR" 2>/dev/null
 
 PREV_STATUS=healthy
@@ -208,6 +263,11 @@ if [ -r "$STATE_FILE" ]; then
     PREV_STATUS="${PREV_STATUS:-healthy}"
     PREV_ALERT="${PREV_ALERT:-0}"
 fi
+
+# Called BEFORE the feed verdict, deliberately: the unhealthy path exits 1
+# further down, so anything placed after it would be skipped on exactly the runs
+# where a crashing resolver is the most likely explanation.
+check_resolver_health
 
 REASON=$(check_feeds)
 RC=$?

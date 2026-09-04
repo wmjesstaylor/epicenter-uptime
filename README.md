@@ -177,9 +177,26 @@ This box carries a Cloudflare/Google resolver config that is correct on Ubuntu
 core-dumps and a lost USGS poll on 2026-09-02, and both were reverted).
 
 The script's own 24.04 guard cannot help here: an OS upgrade never runs the
-script, it just leaves the config in place for the new systemd to read. Re-apply
-only if the bug is confirmed fixed, and watch
-`journalctl -u systemd-resolved -f | grep Assertion` afterwards.
+script, it just leaves the config in place for the new systemd to read.
+
+**The hazard is landing on 24.04 specifically**, not upgrading as such:
+
+| Ubuntu | systemd | Affected? |
+|---|---|---|
+| 22.04 | 249 | no — current state |
+| **24.04** | **255.4** | **YES** — the default `do-release-upgrade` target |
+| 26.04 LTS | 259.5 | no — contains the fix |
+
+Upstream this is systemd issue #34956, fixed by PR #36596 (milestone v258): a
+TCP Fast Open race where a DNS server that answers faster than resolved can
+identify the peer causes a read before the address family is known. Cloudflare
+and Google are fast enough to trigger it; DigitalOcean's resolvers are not.
+LTS releases do not bump systemd major versions, so 24.04 will not receive the
+fix through normal updates.
+
+Going 22.04 → 26.04 LTS is safe and the config can stay. Going to 24.04, revert
+first. Either way, watch `journalctl -u systemd-resolved -f | grep Assertion`
+afterwards.
 
 As a backstop, `epicenter-feed-probe` counts resolver core-dumps in the last
 hour and alerts if it finds any — a note is not a control. Ubuntu 22.04 standard

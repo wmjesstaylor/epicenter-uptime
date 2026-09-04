@@ -60,6 +60,22 @@
 # on seismology (22.04), where the fault it fixes is severe (195 TCP escalations,
 # a 13-second stall that paged) and the crash does not occur.
 #
+# ROOT CAUSE (systemd issue #34956, fixed by PR #36596, milestone v258):
+# a TCP Fast Open race — if the DNS server answers FASTER than resolved finishes
+# identifying the peer, it reads the packet before the address family is known
+# and the assertion fires. That is precisely why Cloudflare/Google trigger it and
+# DigitalOcean's resolvers do not: 1.1.1.1 and 8.8.8.8 are anycast and answer in
+# sub-millisecond time from inside a DO datacentre. The replacement resolvers
+# were not worse, they were FASTER, and the speed was the trigger.
+#
+# VERSION BOUNDARY — the number that decides everything:
+#     Ubuntu 22.04  systemd 249    unaffected  (seismology; change kept here)
+#     Ubuntu 24.04  systemd 255.4  AFFECTED    (poseidon, staging; reverted)
+#     Ubuntu 26.04  systemd 259.5  fixed
+# LTS releases do not bump systemd major versions, so 24.04 will NOT get this
+# via normal updates — it needs a Canonical SRU backport and none appears filed.
+# Do not wait for it.
+#
 # Check the OS before running:  . /etc/os-release; echo "$VERSION_ID"
 #
 # The wider lesson: applying this fleet-wide "for consistency" traded a
